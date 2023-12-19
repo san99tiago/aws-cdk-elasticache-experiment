@@ -9,6 +9,7 @@ from aws_cdk import (
     aws_lambda,
     aws_elasticache,
     Duration,
+    RemovalPolicy,
 )
 from constructs import Construct
 
@@ -35,6 +36,7 @@ class ElasticacheStack(Stack):
 
         # Main methods for the deployment
         self.import_resources()
+        self.create_lambda_layers()
         self.create_lambda_functions()
         self.create_elasticache_redis()
 
@@ -50,6 +52,25 @@ class ElasticacheStack(Stack):
             self,
             "VPC",
             is_default=True,
+        )
+
+    def create_lambda_layers(self):
+        """
+        Create the Lambda layers that are necessary for the additional runtime
+        dependencies of the Lambda Functions.
+        """
+
+        # Layer for "Redis" Python libraries
+        self.lambda_layer_redis = aws_lambda.LayerVersion(
+            self,
+            id="LambdaLayer-Redis",
+            code=aws_lambda.Code.from_asset("lambda-layers/redis/modules"),
+            compatible_runtimes=[
+                aws_lambda.Runtime.PYTHON_3_10,
+                aws_lambda.Runtime.PYTHON_3_11,
+            ],
+            description="Lambda Layer for Python dependencies with <redis> library",
+            removal_policy=RemovalPolicy.DESTROY,
         )
 
     def create_lambda_functions(self):
@@ -87,6 +108,9 @@ class ElasticacheStack(Stack):
                 "LOG_LEVEL": "DEBUG",
                 "ENV": self.deployment_environment,
             },
+            layers=[
+                self.lambda_layer_redis,
+            ],
             log_format=aws_lambda.LogFormat.JSON.value,
             application_log_level=aws_lambda.ApplicationLogLevel.DEBUG.value,
         )
@@ -109,16 +133,12 @@ class ElasticacheStack(Stack):
             connection=aws_ec2.Port.tcp(6379),
         )
 
-        # Elasticache for Redis Serverless
-        self.elasticache = aws_elasticache.CfnServerlessCache(
+        # For creating ElastiCache Clusters in VPC, we need a subnet-group
+        redis_subnet_group = aws_elasticache.CfnSubnetGroup(
             self,
-            "Redis-Cluster",
-            engine="redis",
-            serverless_cache_name=f"{self.main_resources_name}-{self.deployment_environment}",
-            security_group_ids=[redis_sec_group.security_group_id],
-            description="Redis Serverless Cache to be used as primary database",
+            "SubnetGroup-Redis",
             subnet_ids=self.vpc.select_subnets(
-                subnet_type=aws_ec2.SubnetType.PUBLIC,
+                subnet_type=aws_ec2.SubnetType.PUBLIC,  # Might change to private later
                 subnet_filters=[
                     aws_ec2.SubnetFilter.availability_zones(
                         availability_zones=[
@@ -128,13 +148,49 @@ class ElasticacheStack(Stack):
                     )
                 ],
             ).subnet_ids,
+            description=f"Subnet group for Redis cluster for {self.main_resources_name}",
         )
 
-        # TODO: Note: as of current CDK version (2.115.0), this returns an error...
-        # # Add env-var for Lambda Function to get REDIS endpoint
-        # self.lambda_function.add_environment(
-        #     "REDIS_HOST", self.elasticache.attr_endpoint.to_string()
+        # # TODO: Note: as of current CDK version (2.115.0), this returns an error...
+        # # ... when adding retrieving the redis endpoint from the construct (?)
+        # # Elasticache for Redis Serverless
+        # self.elasticache = aws_elasticache.CfnServerlessCache(
+        #     self,
+        #     "ElastiCache-Redis",
+        #     engine="redis",
+        #     serverless_cache_name=f"{self.main_resources_name}-{self.deployment_environment}",
+        #     security_group_ids=[redis_sec_group.security_group_id],
+        #     description="Redis Serverless Cache to be used as primary database",
+        #     subnet_ids=self.vpc.select_subnets(
+        #         subnet_type=aws_ec2.SubnetType.PUBLIC,
+        #         subnet_filters=[
+        #             aws_ec2.SubnetFilter.availability_zones(
+        #                 availability_zones=[
+        #                     "us-east-1a",
+        #                     "us-east-1b",
+        #                 ]
+        #             )
+        #         ],
+        #     ).subnet_ids,
         # )
+
+        # Elasticache for Redis cluster (as "Serverless" not mature yet)
+        self.elasticache = aws_elasticache.CfnCacheCluster(
+            scope=self,
+            id="ElastiCache-Redis",
+            engine="redis",
+            cache_node_type="cache.t3.micro",
+            num_cache_nodes=1,
+            cache_subnet_group_name=redis_subnet_group.ref,
+            vpc_security_group_ids=[redis_sec_group.security_group_id],
+        )
+
+        self.lambda_function.add_environment(
+            "REDIS_HOST", self.elasticache.attr_redis_endpoint_address
+        )
+        self.lambda_function.add_environment(
+            "REDIS_PORT", self.elasticache.attr_redis_endpoint_port
+        )
 
     def generate_cloudformation_outputs(self):
         """
@@ -147,10 +203,3 @@ class ElasticacheStack(Stack):
             value=self.deployment_environment,
             description="Deployment environment",
         )
-
-        # CfnOutput(
-        #     self,
-        #     "ElasticacheEndpoint",
-        #     value=self.elasticache.attr_endpoint,
-        #     description="ElastiCache Endpoint for Redis",
-        # )
